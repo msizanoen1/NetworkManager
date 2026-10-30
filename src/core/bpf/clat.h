@@ -5,9 +5,13 @@
 #include <linux/in6.h>
 
 struct clat_config {
+#ifdef NKXLAT
+    struct in_addr untranslatable_v4;
+#else
     struct in6_addr local_v6;
-    struct in6_addr pref64;
     struct in_addr  local_v4;
+#endif
+    struct in6_addr pref64;
     unsigned        pref64_len;
 };
 
