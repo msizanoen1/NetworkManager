@@ -2,6 +2,7 @@
 /* Copyright 2021 Toke Høiland-Jørgensen <toke@toke.dk> */
 /* Copyright 2025 Mary Strodl <mstrodl@csh.rit.edu> */
 /* Copyright 2026 Beniamino Galvani <bgalvani@redhat.com> */
+/* Copyright 2026 Myrrh Periwinkle <myrrhperiwinkle@qtmlabs.xyz> */
 
 /**
  * This is an implementation of a CLAT in eBPF. BPF is a different environment
