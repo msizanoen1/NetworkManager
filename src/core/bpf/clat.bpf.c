@@ -1390,8 +1390,8 @@ SEC("netkit/peer")
 int
 nm_clat_peer(struct __sk_buff *skb)
 {
-    void          *data_end;
-    void          *data;
+    void          *data_end = SKB_DATA_END(skb);
+    void          *data     = SKB_DATA(skb);
     struct ethhdr *eth;
 
     if (!ensure_header(&eth, skb, &data, &data_end, 0)) {
