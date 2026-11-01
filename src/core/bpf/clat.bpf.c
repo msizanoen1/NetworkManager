@@ -678,7 +678,11 @@ v6addr_to_v4(const struct in6_addr *addr6, int pref64_len, __be32 *addr4, struct
 static __always_inline int
 clat_handle_v4(struct __sk_buff *skb, bool has_eth)
 {
+#ifdef NKXLAT
+    int ret = TC_ACT_SHOT;
+#else
     int             ret      = TC_ACT_OK;
+#endif
     void           *data_end = SKB_DATA_END(skb);
     void           *data     = SKB_DATA(skb);
     struct ipv6hdr *ip6h;
@@ -788,11 +792,7 @@ clat_handle_v4(struct __sk_buff *skb, bool has_eth)
         break;
     }
 
-#ifdef NKXLAT
-    ret = TC_ACT_OK;
-#else
     ret = bpf_redirect(skb->ifindex, 0);
-#endif
 out:
     if (ret == TC_ACT_SHOT)
         __sync_fetch_and_add(&stats.egress_dropped, 1);
@@ -1146,7 +1146,11 @@ rewrite_icmpv6(struct __sk_buff *skb, int *out_length_diff, bool has_eth)
 static __always_inline int
 clat_handle_v6(struct __sk_buff *skb, bool has_eth)
 {
+#ifdef NKXLAT
+    int ret = TC_ACT_SHOT;
+#else
     int             ret      = TC_ACT_OK;
+#endif
     void           *data_end = SKB_DATA_END(skb);
     void           *data     = SKB_DATA(skb);
     struct ethhdr  *eth;
@@ -1364,7 +1368,7 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
     }
 
 #ifdef NKXLAT
-    ret = TC_ACT_OK;
+    ret = bpf_redirect(skb->ifindex, 0);
 #else
     ret = bpf_redirect(skb->ifindex, BPF_F_INGRESS);
 #endif
@@ -1382,18 +1386,27 @@ out:
  * CAP_PERFMON. The loader attaches the right program pair based
  * on the interface type. */
 #ifdef NKXLAT
-SEC("netkit/primary")
-int
-nm_clat_primary(struct __sk_buff *skb)
-{
-    return clat_handle_v6(skb, true);
-}
-
 SEC("netkit/peer")
 int
 nm_clat_peer(struct __sk_buff *skb)
 {
-    return clat_handle_v4(skb, true);
+    void          *data_end;
+    void          *data;
+    struct ethhdr *eth;
+
+    if (!ensure_header(&eth, skb, &data, &data_end, 0)) {
+        return TC_ACT_SHOT;
+    }
+
+    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+        return clat_handle_v4(skb, true);
+    }
+
+    if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+        return clat_handle_v6(skb, true);
+    }
+
+    return TC_ACT_SHOT;
 }
 #else
 SEC("tcx/egress")
