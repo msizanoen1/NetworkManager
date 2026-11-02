@@ -2,7 +2,9 @@
 #ifndef __NAT64_H__
 #define __NAT64_H__
 
+#ifndef NKXLAT
 #include <linux/in6.h>
+#endif
 
 struct clat_config {
 #ifdef NKXLAT

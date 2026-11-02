@@ -13,6 +13,63 @@
  * Check out src/core/bpf/meson.build to see how this gets built.
  **/
 
+#ifdef NKXLAT
+#include <vmlinux.h>
+
+#define TC_ACT_SHOT 2
+
+#define ETH_P_IP   0x0800 /* Internet Protocol packet     */
+#define ETH_P_IPV6 0x86DD /* IPv6 over bluebook           */
+
+#define IPPROTO_FRAGMENT 44 /* IPv6 fragmentation header	*/
+#define IPPROTO_ICMPV6   58 /* ICMPv6			*/
+
+#define s6_addr   in6_u.u6_addr8
+#define s6_addr16 in6_u.u6_addr16
+#define s6_addr32 in6_u.u6_addr32
+
+#define ICMP_ECHOREPLY     0  /* Echo Reply			*/
+#define ICMP_DEST_UNREACH  3  /* Destination Unreachable	*/
+#define ICMP_ECHO          8  /* Echo Request			*/
+#define ICMP_TIME_EXCEEDED 11 /* Time Exceeded		*/
+#define ICMP_PARAMETERPROB 12 /* Parameter Problem		*/
+#define ICMP_NET_UNREACH   0  /* Network Unreachable		*/
+#define ICMP_HOST_UNREACH  1  /* Host Unreachable		*/
+#define ICMP_PROT_UNREACH  2  /* Protocol Unreachable		*/
+#define ICMP_PORT_UNREACH  3  /* Port Unreachable		*/
+#define ICMP_FRAG_NEEDED   4  /* Fragmentation Needed/DF set	*/
+#define ICMP_SR_FAILED     5  /* Source Route failed		*/
+#define ICMP_NET_UNKNOWN   6
+#define ICMP_HOST_UNKNOWN  7
+#define ICMP_HOST_ISOLATED 8
+#define ICMP_NET_ANO       9
+#define ICMP_HOST_ANO      10
+#define ICMP_NET_UNR_TOS   11
+#define ICMP_HOST_UNR_TOS  12
+#define ICMP_PKT_FILTERED  13 /* Packet filtered */
+#define ICMP_PREC_CUTOFF   15 /* Precedence cut off */
+#define ICMP_EXC_TTL       0  /* TTL count exceeded		*/
+#define ICMP_EXC_FRAGTIME  1  /* Fragment Reass time exceeded	*/
+
+#define ICMPV6_DEST_UNREACH   1
+#define ICMPV6_PKT_TOOBIG     2
+#define ICMPV6_TIME_EXCEED    3
+#define ICMPV6_PARAMPROB      4
+#define ICMPV6_ECHO_REQUEST   128
+#define ICMPV6_ECHO_REPLY     129
+#define ICMPV6_NOROUTE        0
+#define ICMPV6_ADM_PROHIBITED 1
+#define ICMPV6_NOT_NEIGHBOUR  2
+#define ICMPV6_ADDR_UNREACH   3
+#define ICMPV6_PORT_UNREACH   4
+#define ICMPV6_EXC_HOPLIMIT   0
+#define ICMPV6_EXC_FRAGTIME   1
+#define ICMPV6_HDR_FIELD      0
+#define ICMPV6_UNK_NEXTHDR    1
+
+#define icmp6_pointer icmp6_dataun.un_data32[0]
+#define icmp6_mtu     icmp6_dataun.un_data32[0]
+#else
 #include <linux/bpf.h>
 #include <linux/icmp.h>
 #include <linux/icmpv6.h>
@@ -25,6 +82,7 @@
 #include <linux/udp.h>
 #include <linux/if_ether.h>
 #include <stdbool.h>
+#endif
 
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
