@@ -1386,8 +1386,9 @@ out:
  * CAP_PERFMON. The loader attaches the right program pair based
  * on the interface type. */
 #ifdef NKXLAT
-static __always_inline int
-nm_clat_common(struct __sk_buff *skb)
+SEC("netkit/peer")
+int
+nm_clat_peer(struct __sk_buff *skb)
 {
     void          *data_end = SKB_DATA_END(skb);
     void          *data     = SKB_DATA(skb);
@@ -1406,20 +1407,6 @@ nm_clat_common(struct __sk_buff *skb)
     }
 
     return TC_ACT_SHOT;
-}
-
-SEC("netkit/peer")
-int
-nm_clat_peer(struct __sk_buff *skb)
-{
-    return nm_clat_common(skb);
-}
-
-SEC("tc")
-int
-nm_clat_tc(struct __sk_buff *skb)
-{
-    return nm_clat_common(skb);
 }
 #else
 SEC("tcx/egress")
