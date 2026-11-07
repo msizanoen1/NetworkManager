@@ -749,6 +749,9 @@ clat_handle_v4(struct __sk_buff *skb, bool has_eth)
     };
     struct iphdr  *iph;
     struct ethhdr *eth;
+    bool           fragmented = false;
+    __u16          frag_off;
+    __u16          id;
 
     if (!ensure_header(&iph, skb, &data, &data_end, L2_H_LEN(has_eth)))
         goto out;
@@ -772,19 +775,18 @@ clat_handle_v4(struct __sk_buff *skb, bool has_eth)
      */
     ret = TC_ACT_SHOT;
 
-    /* we don't bother dealing with IP options or fragmented packets. The
-     * latter are identified by the 'frag_off' field having a value (either
-     * the MF bit, or the fragment offset, or both). However, this field also
-     * contains the "don't fragment" (DF) bit, which we ignore, so mask that
-     * out. The DF is the second-most-significant bit (as bit 0 is
-     * reserved).
+    /* we don't bother dealing with IP options.
      */
 
-    if (iph->ihl != 5 || (iph->frag_off & ~bpf_htons(1 << 14))) {
-        DBG("v4: pkt src/dst %pI4/%pI4 has IP options or is fragmented, dropping\n",
-            &iph->saddr,
-            &iph->daddr);
+    if (iph->ihl != 5) {
+        DBG("v4: pkt src/dst %pI4/%pI4 has IP options, dropping\n", &iph->saddr, &iph->daddr);
         goto out;
+    }
+
+    if (iph->frag_off & ~bpf_htons(1 << 14)) {
+        fragmented = true;
+        frag_off   = bpf_ntohs(iph->frag_off);
+        id         = bpf_ntohs(iph->id);
     }
 
     if (!v4addr_to_v6(iph->daddr, &dst_hdr.daddr, &config.pref64, config.pref64_len))
@@ -807,16 +809,43 @@ clat_handle_v4(struct __sk_buff *skb, bool has_eth)
 
     switch (dst_hdr.nexthdr) {
     case IPPROTO_ICMP:
+        if (fragmented)
+            goto out;
+
         if (rewrite_icmp(skb, &dst_hdr, has_eth))
             goto out;
         dst_hdr.nexthdr = IPPROTO_ICMPV6;
         break;
     case IPPROTO_TCP:
     case IPPROTO_UDP:
-        update_l4_checksum(skb, &dst_hdr, iph, has_eth, true, false, false, NULL);
+        if (!fragmented || (bpf_ntohs(iph->frag_off) & 0x1FFF) == 0) {
+            update_l4_checksum(skb, &dst_hdr, iph, has_eth, true, false, false, NULL);
+        }
         break;
     default:
         break;
+    }
+
+    if (fragmented) {
+        struct ip6_frag *frag;
+
+        /* Add the IPv6 fragment header */
+        if (bpf_skb_adjust_room(skb, (__s32) IP6_FRAG_H_LEN, BPF_ADJ_ROOM_NET, 0))
+            goto out;
+
+        data     = SKB_DATA(skb);
+        data_end = SKB_DATA_END(skb);
+
+        if (!ensure_header(&frag, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN))
+            goto out;
+
+        frag->nexthdr        = dst_hdr.nexthdr;
+        frag->reserved       = 0;
+        frag->offset         = bpf_htons(((frag_off & (1 << 13)) >> 13) | (frag_off << 3));
+        frag->identification = bpf_htonl(id);
+
+        dst_hdr.nexthdr     = IPPROTO_FRAGMENT;
+        dst_hdr.payload_len = bpf_htons(bpf_ntohs(dst_hdr.payload_len) + (int) IP6_FRAG_H_LEN);
     }
 
     if (bpf_skb_change_proto(skb, bpf_htons(ETH_P_IPV6), 0))
@@ -1046,7 +1075,11 @@ rewrite_icmpv6_inner(struct __sk_buff *skb, __u32 *csum_diff, bool has_eth)
 }
 
 static __always_inline int
-rewrite_ipv6_inner(struct __sk_buff *skb, struct iphdr *dst_hdr, __u32 *csum_diff, bool has_eth)
+rewrite_ipv6_inner(struct __sk_buff *skb,
+                   struct iphdr     *dst_hdr,
+                   __u32            *csum_diff,
+                   int              *out_length_diff,
+                   bool              has_eth)
 {
     void           *data_end = SKB_DATA_END(skb);
     void           *data     = SKB_DATA(skb);
@@ -1057,6 +1090,9 @@ rewrite_ipv6_inner(struct __sk_buff *skb, struct iphdr *dst_hdr, __u32 *csum_dif
     __be32          saddr4;
     struct in6_addr ssubnet_v6;
 #endif
+    struct ipv6hdr   ip6h_buf;
+    struct ip6_frag *frag;
+    struct ip6_frag  frag_buf;
 
     /*
      * ip6h:                                  v
@@ -1067,6 +1103,36 @@ rewrite_ipv6_inner(struct __sk_buff *skb, struct iphdr *dst_hdr, __u32 *csum_dif
 
     if (!ensure_header(&ip6h, skb, &data, &data_end, L2_H_LEN(has_eth) + IP6_H_LEN + ICMP6_H_LEN))
         return -1;
+
+    if (ip6h->nexthdr == IPPROTO_FRAGMENT) {
+        ip6h_buf = *ip6h;
+        ip6h     = &ip6h_buf;
+
+        if (!ensure_header(&frag,
+                           skb,
+                           &data,
+                           &data_end,
+                           L2_H_LEN(has_eth) + IP6_H_LEN + ICMP6_H_LEN + IP6_H_LEN))
+            return -1;
+
+        if (bpf_ntohs(frag->offset) >> 3)
+            return -1;
+
+        frag_buf = *frag;
+
+        if (bpf_skb_adjust_room(skb, -(__s32) IP6_FRAG_H_LEN, BPF_ADJ_ROOM_NET, 0))
+            return -1;
+
+        *out_length_diff -= (int) IP6_FRAG_H_LEN;
+
+        if (csum_diff) {
+            *csum_diff = bpf_csum_diff((__be32 *) &frag_buf,
+                                       IP6_FRAG_H_LEN,
+                                       (__be32 *) &frag_buf,
+                                       0,
+                                       *csum_diff);
+        }
+    }
 
 #ifdef NKXLAT
     if (!v6addr_to_v4(&ip6h->saddr, config.pref64_len, &saddr4, &ssubnet_v6))
@@ -1087,6 +1153,9 @@ rewrite_ipv6_inner(struct __sk_buff *skb, struct iphdr *dst_hdr, __u32 *csum_dif
 #else
     translate_ipv6_header(ip6h, dst_hdr, config.local_v4.s_addr, addr4);
 #endif
+
+    if (dst_hdr->protocol == IPPROTO_FRAGMENT)
+        dst_hdr->protocol = frag_buf.nexthdr;
 
     if (csum_diff) {
         /* Checksum difference between the old IPv6 header and the new IPv4 one */
@@ -1159,8 +1228,11 @@ rewrite_icmpv6(struct __sk_buff *skb, int *out_length_diff, bool has_eth)
      * Track in csum_diff the incremental changes to the checksum for the ICMPv4
      * header. */
 
-    if (rewrite_ipv6_inner(skb, &ip_in_buf, &csum_diff, has_eth))
+    if (rewrite_ipv6_inner(skb, &ip_in_buf, &csum_diff, out_length_diff, has_eth))
         return -1;
+
+    if (icmp_buf.type == ICMP_DEST_UNREACH && icmp_buf.code == ICMP_FRAG_NEEDED)
+        icmp_buf.un.frag.mtu = bpf_ntohs(bpf_htons(icmp_buf.un.frag.mtu) + *out_length_diff);
 
     /* The inner IP header shrinks from 40 (IPv6) to 20 (IPv4) bytes; we need to move
      * the L4 header and payload. BPF programs don't have an easy way to move a variable
@@ -1172,7 +1244,7 @@ rewrite_icmpv6(struct __sk_buff *skb, int *out_length_diff, bool has_eth)
     if (bpf_skb_adjust_room(skb, (int) IP_H_LEN - (int) IP6_H_LEN, BPF_ADJ_ROOM_NET, 0))
         return -1;
 
-    *out_length_diff = (int) IP_H_LEN - (int) IP6_H_LEN;
+    *out_length_diff += (int) IP_H_LEN - (int) IP6_H_LEN;
 
     data_end = SKB_DATA_END(skb);
     data     = SKB_DATA(skb);
