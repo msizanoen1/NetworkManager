@@ -961,7 +961,7 @@ translate_icmpv6_header(const struct icmp6hdr *icmp6, struct icmphdr *icmp)
         icmp->type = ICMP_DEST_UNREACH;
         icmp->code = ICMP_FRAG_NEEDED;
 
-        mtu = bpf_ntohl(icmp6->icmp6_mtu) - 20;
+        mtu = bpf_ntohl(icmp6->icmp6_mtu) - (int) IP6_H_LEN - (int) IP6_FRAG_H_LEN;
         if (mtu > 0xffff)
             return -1;
         icmp->un.frag.mtu = bpf_htons(mtu);
@@ -1230,9 +1230,6 @@ rewrite_icmpv6(struct __sk_buff *skb, int *out_length_diff, bool has_eth)
 
     if (rewrite_ipv6_inner(skb, &ip_in_buf, &csum_diff, out_length_diff, has_eth))
         return -1;
-
-    if (icmp_buf.type == ICMP_DEST_UNREACH && icmp_buf.code == ICMP_FRAG_NEEDED)
-        icmp_buf.un.frag.mtu = bpf_ntohs(bpf_htons(icmp_buf.un.frag.mtu) + *out_length_diff);
 
     /* The inner IP header shrinks from 40 (IPv6) to 20 (IPv4) bytes; we need to move
      * the L4 header and payload. BPF programs don't have an easy way to move a variable
