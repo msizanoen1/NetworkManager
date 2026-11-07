@@ -1190,7 +1190,7 @@ rewrite_ipv6_inner(struct __sk_buff *skb,
 
     if (dst_hdr->protocol == IPPROTO_FRAGMENT) {
         dst_hdr->protocol = frag_buf.nexthdr;
-        dst_hdr->frag_off = 1 << 13;
+        dst_hdr->frag_off = bpf_htons(1 << 13);
     }
 
     if (csum_diff) {
