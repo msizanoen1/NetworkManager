@@ -200,6 +200,10 @@ update_l4_checksum(struct __sk_buff *skb,
         csum   = bpf_csum_diff(from_ptr, 2 * sizeof(__u32), to_ptr, 2 * sizeof(struct in6_addr), 0);
         offset = L2_H_LEN(has_eth) + IP_H_LEN;
         ip_type = ip6h->nexthdr;
+
+        if (is_inner) {
+            offset = offset + ICMP_H_LEN + IP_H_LEN;
+        }
     } else {
         void *from_ptr = &ip6h->saddr;
         void *to_ptr   = &iph->saddr;
@@ -288,6 +292,8 @@ update_icmp_checksum(struct __sk_buff     *skb,
 
     if (v4to6) {
         offset = L2_H_LEN(has_eth) + IP_H_LEN + 2;
+        if (is_inner)
+            offset += ICMP_H_LEN + IP_H_LEN;
     } else {
         offset = L2_H_LEN(has_eth) + IP6_H_LEN + 2;
         if (is_inner)
@@ -313,10 +319,68 @@ static __always_inline bool
 v4addr_to_v6(__be32 addr4, struct in6_addr *addr6, const struct in6_addr *pref64, int pref64_len);
 
 static __always_inline int
+rewrite_icmp_inner(struct __sk_buff *skb, struct ipv6hdr *ip6h, bool has_eth, __u32 *csum_diff)
+{
+    void *data_end = SKB_DATA_END(skb);
+    void *data     = SKB_DATA(skb);
+
+    struct icmphdr   icmp_buf;  /* copy of the old ICMPv4 header */
+    struct icmp6hdr  icmp6_buf; /* buffer for the new ICMPv6 header */
+    struct icmphdr  *icmp;
+    struct icmp6hdr *icmp6;
+
+    if (!ensure_header(&icmp,
+                       skb,
+                       &data,
+                       &data_end,
+                       L2_H_LEN(has_eth) + IP_H_LEN + ICMP_H_LEN + IP_H_LEN))
+        return -1;
+
+    icmp_buf  = *icmp;
+    icmp6     = (void *) icmp;
+    icmp6_buf = *icmp6;
+
+    switch (icmp_buf.type) {
+    case ICMP_ECHO:
+        icmp6_buf.icmp6_type = ICMPV6_ECHO_REQUEST;
+        break;
+    case ICMP_ECHOREPLY:
+        icmp6_buf.icmp6_type = ICMPV6_ECHO_REPLY;
+        break;
+    default:
+        return -1;
+    }
+
+    *icmp6 = icmp6_buf;
+
+    update_icmp_checksum(skb, ip6h, &icmp_buf, icmp6, has_eth, true, true, 0);
+
+    data_end = SKB_DATA_END(skb);
+    data     = SKB_DATA(skb);
+
+    if (!ensure_header(&icmp6,
+                       skb,
+                       &data,
+                       &data_end,
+                       L2_H_LEN(has_eth) + IP_H_LEN + ICMP_H_LEN + IP_H_LEN))
+        return -1;
+
+    if (csum_diff) {
+        *csum_diff = bpf_csum_diff((__be32 *) &icmp_buf,
+                                   ICMP_H_LEN,
+                                   (__be32 *) icmp6,
+                                   ICMP6_H_LEN,
+                                   *csum_diff);
+    }
+
+    return 0;
+}
+
+static __always_inline int
 rewrite_ipv4_inner(struct __sk_buff *skb, bool has_eth, __u32 *csum_diff)
 {
-    void           *data_end;
-    void           *data;
+    void           *data_end = SKB_DATA_END(skb);
+    void           *data     = SKB_DATA(skb);
     struct ipv6hdr *ip6h;
     struct ipv6hdr  dst_hdr = {
         .version = 6,
@@ -324,18 +388,10 @@ rewrite_ipv4_inner(struct __sk_buff *skb, bool has_eth, __u32 *csum_diff)
     struct iphdr *iph;
     struct iphdr  iph_buf;
 
-    if (bpf_skb_adjust_room(skb, (int) IP6_H_LEN - (int) IP_H_LEN, BPF_ADJ_ROOM_NET, 0))
+    if (!ensure_header(&iph, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN + ICMP_H_LEN))
         return -1;
 
-    data_end = SKB_DATA_END(skb);
-    data     = SKB_DATA(skb);
-
-    if (!ensure_header(&iph, skb, &data, &data_end, L2_H_LEN(has_eth) + IP6_H_LEN + ICMP_H_LEN))
-        return -1;
-
-    iph_buf = *iph;
-
-    if (iph_buf.version != 4)
+    if (iph->version != 4)
         return -1;
 
 #ifndef NKXLAT
@@ -343,74 +399,52 @@ rewrite_ipv4_inner(struct __sk_buff *skb, bool has_eth, __u32 *csum_diff)
         return -1;
 #endif
 
-    if (!v4addr_to_v6(iph_buf.daddr, &dst_hdr.daddr, &config.pref64, config.pref64_len))
+    if (!v4addr_to_v6(iph->daddr, &dst_hdr.daddr, &config.pref64, config.pref64_len))
         return -1;
 
-    if (iph_buf.protocol == IPPROTO_ICMP) {
-        struct icmphdr   icmp_buf;  /* copy of the old ICMPv4 header */
-        struct icmp6hdr  icmp6_buf; /* buffer for the new ICMPv6 header */
-        struct icmphdr  *icmp;
-        struct icmp6hdr *icmp6;
-
-        if (!ensure_header(&icmp,
-                           skb,
-                           &data,
-                           &data_end,
-                           L2_H_LEN(has_eth) + IP6_H_LEN + ICMP_H_LEN + IP_H_LEN))
-            return -1;
-
-        icmp_buf  = *icmp;
-        icmp6     = (void *) icmp;
-        icmp6_buf = *icmp6;
-
-        switch (icmp_buf.type) {
-        case ICMP_ECHO:
-            icmp6_buf.icmp6_type = ICMPV6_ECHO_REQUEST;
-            break;
-        case ICMP_ECHOREPLY:
-            icmp6_buf.icmp6_type = ICMPV6_ECHO_REPLY;
-            break;
-        default:
-            return -1;
-        }
-
-        if (csum_diff) {
-            *csum_diff = bpf_csum_diff((__be32 *) &icmp_buf,
-                                       ICMP_H_LEN,
-                                       (__be32 *) &icmp6_buf,
-                                       ICMP6_H_LEN,
-                                       *csum_diff);
-        }
-
-        *icmp6          = icmp6_buf;
-        dst_hdr.nexthdr = IPPROTO_ICMPV6;
-    } else {
-        dst_hdr.nexthdr = iph_buf.protocol;
-    }
-
 #ifdef NKXLAT
-    if (!v4addr_to_v6(iph_buf.saddr, &dst_hdr.saddr, &config.pref64, config.pref64_len))
+    if (!v4addr_to_v6(iph->saddr, &dst_hdr.saddr, &config.pref64, config.pref64_len))
         return -1;
 #else
     dst_hdr.saddr = config.local_v6;
 #endif
-    dst_hdr.hop_limit   = iph_buf.ttl;
-    dst_hdr.priority    = (iph_buf.tos & 0x70) >> 4;
-    dst_hdr.flow_lbl[0] = iph_buf.tos << 4;
-    dst_hdr.payload_len = bpf_htons(bpf_ntohs(iph_buf.tot_len) - IP_H_LEN);
+    dst_hdr.nexthdr     = iph->protocol;
+    dst_hdr.hop_limit   = iph->ttl;
+    dst_hdr.priority    = (iph->tos & 0x70) >> 4;
+    dst_hdr.flow_lbl[0] = iph->tos << 4;
+    dst_hdr.payload_len = bpf_htons(bpf_ntohs(iph->tot_len) - IP_H_LEN);
 
-    if (csum_diff) {
-        *csum_diff = bpf_csum_diff((__be32 *) &iph_buf,
-                                   IP_H_LEN,
-                                   (__be32 *) &dst_hdr,
-                                   IP6_H_LEN,
-                                   *csum_diff);
+    iph_buf = *iph;
+
+    switch (dst_hdr.nexthdr) {
+    case IPPROTO_ICMP:
+        dst_hdr.nexthdr = IPPROTO_ICMPV6;
+        if (rewrite_icmp_inner(skb, &dst_hdr, has_eth, csum_diff))
+            return -1;
+        break;
+    case IPPROTO_TCP:
+    case IPPROTO_UDP:
+        update_l4_checksum(skb, &dst_hdr, iph, has_eth, true, true, false, csum_diff);
+        break;
+    default:
+        break;
     }
+
+    if (bpf_skb_adjust_room(skb, (int) IP6_H_LEN - (int) IP_H_LEN, BPF_ADJ_ROOM_NET, 0))
+        return -1;
+
+    data_end = SKB_DATA_END(skb);
+    data     = SKB_DATA(skb);
 
     if (!ensure_header(&ip6h, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN + ICMP_H_LEN))
         return -1;
 
     *ip6h = dst_hdr;
+
+    if (csum_diff) {
+        *csum_diff =
+            bpf_csum_diff((__be32 *) &iph_buf, IP_H_LEN, (__be32 *) ip6h, IP6_H_LEN, *csum_diff);
+    }
 
     return 0;
 }
