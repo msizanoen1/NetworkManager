@@ -1188,8 +1188,10 @@ rewrite_ipv6_inner(struct __sk_buff *skb,
     translate_ipv6_header(ip6h, dst_hdr, config.local_v4.s_addr, addr4);
 #endif
 
-    if (dst_hdr->protocol == IPPROTO_FRAGMENT)
+    if (dst_hdr->protocol == IPPROTO_FRAGMENT) {
         dst_hdr->protocol = frag_buf.nexthdr;
+        dst_hdr->frag_off = 1 << 13;
+    }
 
     if (csum_diff) {
         /* Checksum difference between the old IPv6 header and the new IPv4 one */
