@@ -319,7 +319,10 @@ static __always_inline bool
 v4addr_to_v6(__be32 addr4, struct in6_addr *addr6, const struct in6_addr *pref64, int pref64_len);
 
 static __always_inline int
-rewrite_icmp_inner(struct __sk_buff *skb, struct ipv6hdr *ip6h, bool has_eth, __u32 *csum_diff)
+rewrite_icmp_inner(struct __sk_buff     *skb,
+                   const struct ipv6hdr *ip6h,
+                   bool                  has_eth,
+                   __u32                *csum_diff)
 {
     void *data_end = SKB_DATA_END(skb);
     void *data     = SKB_DATA(skb);
