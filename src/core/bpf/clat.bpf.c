@@ -324,9 +324,8 @@ rewrite_icmp_inner(struct __sk_buff     *skb,
                    bool                  has_eth,
                    __u32                *csum_diff)
 {
-    void *data_end = SKB_DATA_END(skb);
-    void *data     = SKB_DATA(skb);
-
+    void            *data_end = SKB_DATA_END(skb);
+    void            *data     = SKB_DATA(skb);
     struct icmphdr   icmp_buf;  /* copy of the old ICMPv4 header */
     struct icmp6hdr  icmp6_buf; /* buffer for the new ICMPv6 header */
     struct icmphdr  *icmp;
