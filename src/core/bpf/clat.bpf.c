@@ -1563,6 +1563,10 @@ nm_clat_peer(struct __sk_buff *skb)
         return TC_ACT_SHOT;
     }
 
+    if (eth->h_dest[0] & 0x01) {
+        return TC_ACT_SHOT;
+    }
+
     if (eth->h_proto == bpf_htons(ETH_P_IP)) {
         return clat_handle_v4(skb, true);
     }
