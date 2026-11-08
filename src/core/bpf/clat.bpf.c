@@ -997,7 +997,7 @@ translate_icmpv6_header(const struct icmp6hdr *icmp6, struct icmphdr *icmp)
         icmp->type = ICMP_DEST_UNREACH;
         icmp->code = ICMP_FRAG_NEEDED;
 
-        mtu = bpf_ntohl(icmp6->icmp6_mtu) - (int) IP6_H_LEN - (int) IP6_FRAG_H_LEN;
+        mtu = bpf_ntohl(icmp6->icmp6_mtu) - 28;
         if (mtu > 0xffff)
             return -1;
         icmp->un.frag.mtu = bpf_htons(mtu);
