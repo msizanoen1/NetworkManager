@@ -69,6 +69,8 @@
 
 #define icmp6_pointer icmp6_dataun.un_data32[0]
 #define icmp6_mtu     icmp6_dataun.un_data32[0]
+
+#define ICMP_AFI_IP6 2 /* Address Family Identifier for ipv6 */
 #else
 #include <linux/bpf.h>
 #include <linux/icmp.h>
@@ -1219,7 +1221,7 @@ rewrite_ipv6_inner(struct __sk_buff *skb,
 }
 
 static __always_inline int
-rewrite_icmpv6(struct __sk_buff *skb, int *out_length_diff, bool has_eth)
+rewrite_icmpv6(struct __sk_buff *skb, int *out_length_diff, bool *is_icmp_error, bool has_eth)
 {
     void            *data_end = SKB_DATA_END(skb);
     void            *data     = SKB_DATA(skb);
@@ -1261,6 +1263,8 @@ rewrite_icmpv6(struct __sk_buff *skb, int *out_length_diff, bool has_eth)
                              0);
         return 0;
     }
+
+    *is_icmp_error = true;
 
     /* ICMPv6 error messages: we need to rewrite the headers in the inner packet.
      * Track in csum_diff the incremental changes to the checksum for the ICMPv4
@@ -1330,6 +1334,9 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
 #endif
     int             length_diff = 0;
     bool            fragmented  = false;
+    bool            is_icmp_error  = false;
+    bool            untranslatable = false;
+    struct in6_addr addr6;
 
     if (!ensure_header(&ip6h, skb, &data, &data_end, L2_H_LEN(has_eth)))
         goto out;
@@ -1387,6 +1394,9 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
 #else
         addr4 = __cpu_to_be32(INADDR_DUMMY);
 #endif
+
+        untranslatable = true;
+        addr6          = ip6h->saddr;
     }
 
     /* At this point we know the packet needs translation. If we can't
@@ -1462,7 +1472,7 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
         if (fragmented)
             goto out;
 
-        if (rewrite_icmpv6(skb, &length_diff, has_eth))
+        if (rewrite_icmpv6(skb, &length_diff, &is_icmp_error, has_eth))
             goto out;
         break;
     case IPPROTO_TCP:
@@ -1500,6 +1510,84 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
         /* Remove the IPv6 fragment header */
         if (bpf_skb_adjust_room(skb, -(__s32) IP6_FRAG_H_LEN, BPF_ADJ_ROOM_NET, 0))
             goto out;
+    }
+
+    if (untranslatable) {
+        struct {
+            struct icmphdr           hdr;
+            __u8                     data[128];
+            struct icmp_ext_hdr      ext_hdr;
+            struct icmp_ext_echo_iio ext_echo_iio;
+        } *icmp;
+
+        if (bpf_skb_change_tail(skb, L2_H_LEN(has_eth) + IP_H_LEN + sizeof(*icmp), 0))
+            goto out;
+
+        data     = SKB_DATA(skb);
+        data_end = SKB_DATA_END(skb);
+
+        if (!ensure_header(&icmp, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN))
+            goto out;
+
+        icmp->hdr.un.reserved[1] = sizeof(icmp->data) / 4;
+
+        icmp->ext_hdr.version   = 2;
+        icmp->ext_hdr.reserved1 = 0;
+        icmp->ext_hdr.reserved2 = 0;
+
+        icmp->ext_echo_iio.extobj_hdr.length     = bpf_htons(sizeof(icmp->ext_echo_iio));
+        icmp->ext_echo_iio.extobj_hdr.class_num  = 2;
+        icmp->ext_echo_iio.extobj_hdr.class_type = 4;
+
+        icmp->ext_echo_iio.ident.addr.ctype3_hdr.afi      = bpf_htons(ICMP_AFI_IP6);
+        icmp->ext_echo_iio.ident.addr.ctype3_hdr.addrlen  = 0;
+        icmp->ext_echo_iio.ident.addr.ctype3_hdr.reserved = 0;
+
+        icmp->ext_echo_iio.ident.addr.ip_addr.ipv6_addr = addr6;
+
+        icmp->ext_hdr.checksum = 0;
+        icmp->ext_hdr.checksum =
+            csum_fold_helper(bpf_csum_diff((__be32 *) &icmp->ext_hdr,
+                                           0,
+                                           (__be32 *) &icmp->ext_hdr,
+                                           sizeof(icmp->ext_hdr) + sizeof(icmp->ext_echo_iio),
+                                           0));
+
+        icmp->hdr.checksum = 0;
+        icmp->hdr.checksum =
+            csum_fold_helper(bpf_csum_diff((__be32 *) icmp, 0, (__be32 *) icmp, sizeof(*icmp), 0));
+
+        dst_hdr.tot_len = bpf_htons(IP_H_LEN + sizeof(*icmp));
+
+        dst_hdr.check = 0;
+        dst_hdr.check = csum_fold_helper(
+            bpf_csum_diff((__be32 *) &dst_hdr, 0, (__be32 *) &dst_hdr, IP_H_LEN, 0));
+    }
+
+    if (is_icmp_error && bpf_htons(dst_hdr.tot_len) > 576) {
+        struct {
+            struct icmphdr hdr;
+            __u8           data[576 - IP_H_LEN - ICMP_H_LEN];
+        } *icmp;
+
+        if (bpf_skb_change_tail(skb, L2_H_LEN(has_eth) + IP_H_LEN + sizeof(*icmp), 0))
+            goto out;
+
+        data     = SKB_DATA(skb);
+        data_end = SKB_DATA_END(skb);
+
+        if (!ensure_header(&icmp, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN))
+            goto out;
+
+        icmp->hdr.checksum = 0;
+        icmp->hdr.checksum =
+            csum_fold_helper(bpf_csum_diff((__be32 *) icmp, 0, (__be32 *) icmp, sizeof(*icmp), 0));
+
+        dst_hdr.tot_len = bpf_htons(IP_H_LEN + sizeof(*icmp));
+
+        dst_hdr.check = 0;
+        dst_hdr.check = csum_fold_helper(
+            bpf_csum_diff((__be32 *) &dst_hdr, 0, (__be32 *) &dst_hdr, IP_H_LEN, 0));
     }
 
     data     = SKB_DATA(skb);
