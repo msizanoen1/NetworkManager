@@ -1627,8 +1627,6 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
             struct icmp_ext_hdr      ext_hdr;
             struct icmp_ext_echo_iio ext_echo_iio;
         } *icmp;
-        __u32  old_len   = skb->len;
-        __wsum csum_diff = 0;
 
         if (bpf_skb_change_tail(skb, L2_H_LEN(has_eth) + IP_H_LEN + sizeof(*icmp), 0))
             goto out;
@@ -1638,15 +1636,6 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
 
         if (!ensure_header(&icmp, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN))
             goto out;
-
-        if (skb->len == old_len) {
-            int old_icmp_len = (int) bpf_ntohs(dst_hdr.tot_len) - (int) IP_H_LEN;
-
-            if (old_icmp_len < 0 || old_icmp_len > sizeof(*icmp))
-                goto out;
-
-            csum_diff = bpf_csum_diff((__be32 *) icmp, old_icmp_len, (__be32 *) icmp, 0, csum_diff);
-        }
 
         icmp->hdr.un.reserved[1] = sizeof(icmp->data) / 4;
 
@@ -1672,22 +1661,9 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
                                            sizeof(icmp->ext_hdr) + sizeof(icmp->ext_echo_iio),
                                            0));
 
-        if (skb->len == old_len) {
-            csum_diff =
-                bpf_csum_diff((__be32 *) icmp, 0, (__be32 *) icmp, sizeof(*icmp), csum_diff);
-
-            if (bpf_l4_csum_replace(skb,
-                                    L2_H_LEN(has_eth) + IP_H_LEN
-                                        + offsetof(struct icmphdr, checksum),
-                                    0,
-                                    csum_diff,
-                                    0))
-                goto out;
-        } else {
-            icmp->hdr.checksum = 0;
-            icmp->hdr.checksum = csum_fold_helper(
-                bpf_csum_diff((__be32 *) icmp, 0, (__be32 *) icmp, sizeof(*icmp), 0));
-        }
+        icmp->hdr.checksum = 0;
+        icmp->hdr.checksum =
+            csum_fold_helper(bpf_csum_diff((__be32 *) icmp, 0, (__be32 *) icmp, sizeof(*icmp), 0));
 
         dst_hdr.tot_len = bpf_htons(IP_H_LEN + sizeof(*icmp));
 
