@@ -219,9 +219,6 @@ update_l4_checksum(struct __sk_buff *skb,
         }
     }
 
-    if (!is_inner)
-        bpf_csum_update(skb, csum);
-
     if (is_v6_fragment) {
         offset += IP6_FRAG_H_LEN;
     }
