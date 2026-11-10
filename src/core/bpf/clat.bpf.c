@@ -71,7 +71,11 @@
 #define icmp6_mtu     icmp6_dataun.un_data32[0]
 
 #define ICMP_AFI_IP6 2 /* Address Family Identifier for ipv6 */
+
+#define EINVAL 22 /* Invalid argument */
+#define EFAULT 14 /* Bad address */
 #else
+#include <linux/errno.h>
 #include <linux/bpf.h>
 #include <linux/icmp.h>
 #include <linux/icmpv6.h>
@@ -177,6 +181,110 @@ _ensure_header(void            **header,
     return true;
 }
 
+static __always_inline __wsum
+csum_add(__wsum csum, __wsum addend)
+{
+    __u32 res = (__u32) csum;
+    res += (__u32) addend;
+    return (__wsum) (res + (res < (__u32) addend));
+}
+
+static __always_inline __wsum
+csum_sub(__wsum csum, __wsum addend)
+{
+    return csum_add(csum, ~addend);
+}
+
+static __always_inline __wsum
+csum_unfold(__sum16 n)
+{
+    return (__wsum) n;
+}
+
+static __always_inline __u16 csum_fold_helper(__u32 csum);
+
+static __always_inline void
+csum_replace_by_diff(__sum16 *sum, __wsum diff)
+{
+    *sum = csum_fold_helper(csum_add(diff, ~csum_unfold(*sum)));
+}
+
+static __always_inline void
+csum_replace4(__sum16 *sum, __be32 from, __be32 to)
+{
+    __wsum tmp = csum_sub(~csum_unfold(*sum), (__wsum) from);
+
+    *sum = csum_fold_helper(csum_add(tmp, (__wsum) to));
+}
+
+static __always_inline __sum16
+csum16_add(__sum16 csum, __be16 addend)
+{
+    __u16 res = (__u16) csum;
+
+    res += (__u16) addend;
+    return (__sum16) (res + (res < (__u16) addend));
+}
+
+static __always_inline __sum16
+csum16_sub(__sum16 csum, __be16 addend)
+{
+    return csum16_add(csum, ~addend);
+}
+
+static __always_inline void
+csum_replace2(__sum16 *sum, __be16 old, __be16 new)
+{
+    *sum = ~csum16_add(csum16_sub(~(*sum), old), new);
+}
+
+static __always_inline long
+l4_csum_replace(struct __sk_buff *skb,
+                __u32             offset,
+                __u64             from,
+                __u64             to,
+                __u64             flags,
+                bool              is_inner)
+{
+    if (is_inner) {
+        void    *data_end = SKB_DATA_END(skb);
+        void    *data     = SKB_DATA(skb);
+        __sum16 *csum;
+        bool     is_mmzero = flags & BPF_F_MARK_MANGLED_0;
+        bool     do_mforce = flags & BPF_F_MARK_ENFORCE;
+
+        if (!ensure_header(&csum, skb, &data, &data_end, offset))
+            return -EFAULT;
+
+        if (is_mmzero && !do_mforce && !*csum)
+            return 0;
+
+        switch (flags & BPF_F_HDR_FIELD_MASK) {
+        case 0:
+            if (unlikely(from != 0))
+                return -EINVAL;
+
+            csum_replace_by_diff(csum, to);
+            break;
+        case 2:
+            csum_replace2(csum, from, to);
+            break;
+        case 4:
+            csum_replace4(csum, from, to);
+            break;
+        default:
+            return -EINVAL;
+        }
+
+        if (is_mmzero && !*csum)
+            *csum = ~0;
+
+        return 0;
+    } else {
+        return bpf_l4_csum_replace(skb, offset, from, to, flags);
+    }
+}
+
 /* This function must be declared as inline because the BPF calling
  * convention only supports up to 5 function arguments. */
 static __always_inline void
@@ -237,7 +345,7 @@ update_l4_checksum(struct __sk_buff *skb,
         return;
     }
 
-    if (bpf_l4_csum_replace(skb, offset, 0, csum, flags)) {
+    if (l4_csum_replace(skb, offset, 0, csum, flags, is_inner)) {
         /* A failure updating the checksum (e.g. packet too short) means we
          * don't need to update csum_diff below. */
         return;
@@ -310,11 +418,11 @@ update_icmp_checksum(struct __sk_buff     *skb,
     u_before = *(__u32 *) (icmp_before + 4);
     u_after  = *(__u32 *) (icmp_after + 4);
 
-    bpf_l4_csum_replace(skb, offset, 0, csum, BPF_F_PSEUDO_HDR);
-    bpf_l4_csum_replace(skb, offset, h_before, h_after, 2);
+    l4_csum_replace(skb, offset, 0, csum, BPF_F_PSEUDO_HDR, is_inner);
+    l4_csum_replace(skb, offset, h_before, h_after, 2, is_inner);
 
     if (u_before != u_after)
-        bpf_l4_csum_replace(skb, offset, u_before, u_after, 4);
+        l4_csum_replace(skb, offset, u_before, u_after, 4, is_inner);
 }
 
 static __always_inline bool
