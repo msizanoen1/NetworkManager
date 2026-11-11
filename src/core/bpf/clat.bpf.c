@@ -1518,10 +1518,7 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
                 goto out;
 
             *icmp_ext = (typeof(*icmp_ext)) {
-                .hdr =
-                    {
-                        .version = 2,
-                    },
+                .hdr.version = 2,
                 .iio =
                     {
                         .extobj_hdr =
