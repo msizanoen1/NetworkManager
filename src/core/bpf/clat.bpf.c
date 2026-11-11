@@ -189,7 +189,7 @@ update_l4_checksum(struct __sk_buff *skb,
                    bool              is_v6_fragment,
                    __u32            *csum_diff)
 {
-    int   flags = is_inner ? 0 : BPF_F_PSEUDO_HDR;
+    int   flags = BPF_F_PSEUDO_HDR;
     __u16 offset;
     __u32 csum;
     int   ip_type;
@@ -310,7 +310,7 @@ update_icmp_checksum(struct __sk_buff     *skb,
     u_before = *(__u32 *) (icmp_before + 4);
     u_after  = *(__u32 *) (icmp_after + 4);
 
-    bpf_l4_csum_replace(skb, offset, 0, csum, is_inner ? 0 : BPF_F_PSEUDO_HDR);
+    bpf_l4_csum_replace(skb, offset, 0, csum, BPF_F_PSEUDO_HDR);
     bpf_l4_csum_replace(skb, offset, h_before, h_after, 2);
 
     if (u_before != u_after)
@@ -882,8 +882,6 @@ clat_handle_v4(struct __sk_buff *skb, bool has_eth)
         frag->offset         = bpf_htons(((frag_off & (1 << 13)) >> 13) | (frag_off << 3));
         frag->identification = bpf_htonl(id);
 
-        bpf_csum_update(skb, bpf_csum_diff((__be32 *) frag, 0, (__be32 *) frag, sizeof(*frag), 0));
-
         dst_hdr.nexthdr     = IPPROTO_FRAGMENT;
         dst_hdr.payload_len = bpf_htons(bpf_ntohs(dst_hdr.payload_len) + (int) IP6_FRAG_H_LEN);
     }
@@ -903,8 +901,6 @@ clat_handle_v4(struct __sk_buff *skb, bool has_eth)
     }
 
     *ip6h = dst_hdr;
-
-    bpf_csum_update(skb, bpf_csum_diff((__be32 *) ip6h, 0, (__be32 *) ip6h, sizeof(*ip6h), 0));
 
     switch (dst_hdr.nexthdr) {
     case IPPROTO_ICMPV6:
@@ -1604,8 +1600,6 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
         eth          = data;
         eth->h_proto = bpf_htons(ETH_P_IP);
     }
-
-    bpf_csum_update(skb, bpf_csum_diff((__be32 *) iph, sizeof(*iph), (__be32 *) iph, 0, 0));
 
     *iph = dst_hdr;
 
