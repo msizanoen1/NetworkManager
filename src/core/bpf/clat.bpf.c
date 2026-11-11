@@ -2,6 +2,7 @@
 /* Copyright 2021 Toke Høiland-Jørgensen <toke@toke.dk> */
 /* Copyright 2025 Mary Strodl <mstrodl@csh.rit.edu> */
 /* Copyright 2026 Beniamino Galvani <bgalvani@redhat.com> */
+/* Copyright 2026 Myrrh Periwinkle <myrrhperiwinkle@qtmlabs.xyz> */
 
 /**
  * This is an implementation of a CLAT in eBPF. BPF is a different environment
@@ -12,6 +13,65 @@
  * Check out src/core/bpf/meson.build to see how this gets built.
  **/
 
+#ifdef NKXLAT
+#include <vmlinux.h>
+
+#define TC_ACT_SHOT 2
+
+#define ETH_P_IP   0x0800 /* Internet Protocol packet     */
+#define ETH_P_IPV6 0x86DD /* IPv6 over bluebook           */
+
+#define IPPROTO_FRAGMENT 44 /* IPv6 fragmentation header	*/
+#define IPPROTO_ICMPV6   58 /* ICMPv6			*/
+
+#define s6_addr   in6_u.u6_addr8
+#define s6_addr16 in6_u.u6_addr16
+#define s6_addr32 in6_u.u6_addr32
+
+#define ICMP_ECHOREPLY     0  /* Echo Reply			*/
+#define ICMP_DEST_UNREACH  3  /* Destination Unreachable	*/
+#define ICMP_ECHO          8  /* Echo Request			*/
+#define ICMP_TIME_EXCEEDED 11 /* Time Exceeded		*/
+#define ICMP_PARAMETERPROB 12 /* Parameter Problem		*/
+#define ICMP_NET_UNREACH   0  /* Network Unreachable		*/
+#define ICMP_HOST_UNREACH  1  /* Host Unreachable		*/
+#define ICMP_PROT_UNREACH  2  /* Protocol Unreachable		*/
+#define ICMP_PORT_UNREACH  3  /* Port Unreachable		*/
+#define ICMP_FRAG_NEEDED   4  /* Fragmentation Needed/DF set	*/
+#define ICMP_SR_FAILED     5  /* Source Route failed		*/
+#define ICMP_NET_UNKNOWN   6
+#define ICMP_HOST_UNKNOWN  7
+#define ICMP_HOST_ISOLATED 8
+#define ICMP_NET_ANO       9
+#define ICMP_HOST_ANO      10
+#define ICMP_NET_UNR_TOS   11
+#define ICMP_HOST_UNR_TOS  12
+#define ICMP_PKT_FILTERED  13 /* Packet filtered */
+#define ICMP_PREC_CUTOFF   15 /* Precedence cut off */
+#define ICMP_EXC_TTL       0  /* TTL count exceeded		*/
+#define ICMP_EXC_FRAGTIME  1  /* Fragment Reass time exceeded	*/
+
+#define ICMPV6_DEST_UNREACH   1
+#define ICMPV6_PKT_TOOBIG     2
+#define ICMPV6_TIME_EXCEED    3
+#define ICMPV6_PARAMPROB      4
+#define ICMPV6_ECHO_REQUEST   128
+#define ICMPV6_ECHO_REPLY     129
+#define ICMPV6_NOROUTE        0
+#define ICMPV6_ADM_PROHIBITED 1
+#define ICMPV6_NOT_NEIGHBOUR  2
+#define ICMPV6_ADDR_UNREACH   3
+#define ICMPV6_PORT_UNREACH   4
+#define ICMPV6_EXC_HOPLIMIT   0
+#define ICMPV6_EXC_FRAGTIME   1
+#define ICMPV6_HDR_FIELD      0
+#define ICMPV6_UNK_NEXTHDR    1
+
+#define icmp6_pointer icmp6_dataun.un_data32[0]
+#define icmp6_mtu     icmp6_dataun.un_data32[0]
+
+#define ICMP_AFI_IP6 2 /* Address Family Identifier for ipv6 */
+#else
 #include <linux/bpf.h>
 #include <linux/icmp.h>
 #include <linux/icmpv6.h>
@@ -24,6 +84,7 @@
 #include <linux/udp.h>
 #include <linux/if_ether.h>
 #include <stdbool.h>
+#endif
 
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
@@ -33,7 +94,9 @@
 char _license[] SEC("license") = "GPL";
 
 struct clat_config config;
+#ifndef NKXLAT
 struct clat_stats  stats;
+#endif
 
 #ifdef DEBUG
 /* Note: when enabling debugging, you also need to add CAP_PERFMON
@@ -250,8 +313,105 @@ update_icmp_checksum(struct __sk_buff     *skb,
         bpf_l4_csum_replace(skb, offset, u_before, u_after, 4);
 }
 
+static __always_inline bool
+v4addr_to_v6(__be32 addr4, struct in6_addr *addr6, const struct in6_addr *pref64, int pref64_len);
+
 static __always_inline int
-rewrite_icmp(struct __sk_buff *skb, const struct ipv6hdr *ip6h, bool has_eth)
+rewrite_ipv4_inner(struct __sk_buff *skb, bool has_eth, __u32 *csum_diff)
+{
+    void           *data_end = SKB_DATA_END(skb);
+    void           *data     = SKB_DATA(skb);
+    struct ipv6hdr *ip6h;
+    struct ipv6hdr  dst_hdr = {
+        .version = 6,
+    };
+    struct iphdr *iph;
+
+    if (!ensure_header(&iph, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN + ICMP_H_LEN))
+        return -1;
+
+    if (iph->version != 4)
+        return -1;
+
+#ifndef NKXLAT
+    if (iph->saddr != config.local_v4.s_addr)
+        return -1;
+#endif
+
+    if (!v4addr_to_v6(iph->daddr, &dst_hdr.daddr, &config.pref64, config.pref64_len))
+        return -1;
+
+#ifdef NKXLAT
+    if (!v4addr_to_v6(iph->saddr, &dst_hdr.saddr, &config.pref64, config.pref64_len))
+        return -1;
+#else
+    dst_hdr.saddr = config.local_v6;
+#endif
+    dst_hdr.nexthdr   = iph->protocol == IPPROTO_ICMP ? IPPROTO_ICMPV6 : iph->protocol;
+    dst_hdr.hop_limit = iph->ttl;
+    /* weird definition in ipv6hdr */
+    dst_hdr.priority    = (iph->tos & 0x70) >> 4;
+    dst_hdr.flow_lbl[0] = iph->tos << 4;
+    dst_hdr.payload_len = bpf_htons(bpf_ntohs(iph->tot_len) - IP_H_LEN);
+
+    if (csum_diff) {
+        *csum_diff =
+            bpf_csum_diff((__be32 *) iph, IP_H_LEN, (__be32 *) &dst_hdr, IP6_H_LEN, *csum_diff);
+    }
+
+    if (dst_hdr.nexthdr == IPPROTO_ICMPV6) {
+        struct icmp6hdr  icmp6_buf;
+        struct icmphdr  *icmp;
+        struct icmp6hdr *icmp6;
+
+        if (!ensure_header(&icmp,
+                           skb,
+                           &data,
+                           &data_end,
+                           L2_H_LEN(has_eth) + IP_H_LEN + ICMP_H_LEN + IP_H_LEN))
+            return -1;
+
+        icmp6     = (void *) icmp;
+        icmp6_buf = *icmp6;
+
+        switch (icmp->type) {
+        case ICMP_ECHO:
+            icmp6_buf.icmp6_type = ICMPV6_ECHO_REQUEST;
+            break;
+        case ICMP_ECHOREPLY:
+            icmp6_buf.icmp6_type = ICMPV6_ECHO_REPLY;
+            break;
+        default:
+            return -1;
+        }
+
+        if (csum_diff) {
+            *csum_diff = bpf_csum_diff((__be32 *) icmp,
+                                       ICMP_H_LEN,
+                                       (__be32 *) &icmp6_buf,
+                                       ICMP6_H_LEN,
+                                       *csum_diff);
+        }
+
+        *icmp6 = icmp6_buf;
+    }
+
+    if (bpf_skb_adjust_room(skb, (int) IP6_H_LEN - (int) IP_H_LEN, BPF_ADJ_ROOM_NET, 0))
+        return -1;
+
+    data_end = SKB_DATA_END(skb);
+    data     = SKB_DATA(skb);
+
+    if (!ensure_header(&ip6h, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN + ICMP_H_LEN))
+        return -1;
+
+    *ip6h = dst_hdr;
+
+    return 0;
+}
+
+static __always_inline int
+rewrite_icmp(struct __sk_buff *skb, struct ipv6hdr *ip6h, bool has_eth)
 {
     void            *data_end = SKB_DATA_END(skb);
     void            *data     = SKB_DATA(skb);
@@ -260,6 +420,7 @@ rewrite_icmp(struct __sk_buff *skb, const struct ipv6hdr *ip6h, bool has_eth)
     struct icmphdr  *icmp;
     struct icmp6hdr *icmp6;
     __u32            mtu;
+    __u32            csum_diff = 0;
 
     if (!ensure_header(&icmp, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN))
         return -1;
@@ -359,14 +520,45 @@ rewrite_icmp(struct __sk_buff *skb, const struct ipv6hdr *ip6h, bool has_eth)
             return -1;
         }
         break;
+    case ICMP_TIME_EXCEEDED:
+        icmp6_buf.icmp6_type = ICMPV6_TIME_EXCEED;
+        switch (icmp->code) {
+        case ICMP_EXC_TTL:
+            icmp6_buf.icmp6_code = ICMPV6_EXC_HOPLIMIT;
+            break;
+        case ICMP_EXC_FRAGTIME:
+            icmp6_buf.icmp6_code = ICMPV6_EXC_FRAGTIME;
+            break;
+        default:
+            return -1;
+        }
+        break;
     default:
         return -1;
     }
 
-    *icmp6 = icmp6_buf;
-    update_icmp_checksum(skb, ip6h, &icmp_buf, icmp6, has_eth, true, false, 0);
+    switch (icmp->type) {
+    case ICMP_DEST_UNREACH:
+    case ICMP_PARAMETERPROB:
+    case ICMP_TIME_EXCEEDED:
+        if (rewrite_ipv4_inner(skb, has_eth, &csum_diff))
+            return -1;
 
-    /* FIXME: also need to rewrite IP header embedded in ICMP error */
+        data_end = SKB_DATA_END(skb);
+        data     = SKB_DATA(skb);
+
+        if (!ensure_header(&icmp6, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN))
+            return -1;
+
+        ip6h->payload_len =
+            bpf_htons(bpf_ntohs(ip6h->payload_len) + ((int) IP6_H_LEN - (int) IP_H_LEN));
+        break;
+    default:
+        break;
+    }
+
+    *icmp6 = icmp6_buf;
+    update_icmp_checksum(skb, ip6h, &icmp_buf, icmp6, has_eth, true, false, csum_diff);
 
     return 0;
 }
@@ -539,7 +731,11 @@ v6addr_to_v4(const struct in6_addr *addr6, int pref64_len, __be32 *addr4, struct
 static __always_inline int
 clat_handle_v4(struct __sk_buff *skb, bool has_eth)
 {
+#ifdef NKXLAT
+    int ret = TC_ACT_SHOT;
+#else
     int             ret      = TC_ACT_OK;
+#endif
     void           *data_end = SKB_DATA_END(skb);
     void           *data     = SKB_DATA(skb);
     struct ipv6hdr *ip6h;
@@ -548,6 +744,9 @@ clat_handle_v4(struct __sk_buff *skb, bool has_eth)
     };
     struct iphdr  *iph;
     struct ethhdr *eth;
+    bool           fragmented = false;
+    __u16          frag_off;
+    __u16          id;
 
     if (!ensure_header(&iph, skb, &data, &data_end, L2_H_LEN(has_eth)))
         goto out;
@@ -561,33 +760,39 @@ clat_handle_v4(struct __sk_buff *skb, bool has_eth)
     if (iph->version != 4)
         goto out;
 
+#ifndef NKXLAT
     if (iph->saddr != config.local_v4.s_addr)
         goto out;
+#endif
 
     /* At this point we know the packet needs translation. If we can't
      * rewrite it, it should be dropped.
      */
     ret = TC_ACT_SHOT;
 
-    /* we don't bother dealing with IP options or fragmented packets. The
-     * latter are identified by the 'frag_off' field having a value (either
-     * the MF bit, or the fragment offset, or both). However, this field also
-     * contains the "don't fragment" (DF) bit, which we ignore, so mask that
-     * out. The DF is the second-most-significant bit (as bit 0 is
-     * reserved).
+    /* we don't bother dealing with IP options.
      */
 
-    if (iph->ihl != 5 || (iph->frag_off & ~bpf_htons(1 << 14))) {
-        DBG("v4: pkt src/dst %pI4/%pI4 has IP options or is fragmented, dropping\n",
-            &iph->saddr,
-            &iph->daddr);
+    if (iph->ihl != 5) {
+        DBG("v4: pkt src/dst %pI4/%pI4 has IP options, dropping\n", &iph->saddr, &iph->daddr);
         goto out;
+    }
+
+    if (iph->frag_off & ~bpf_htons(1 << 14)) {
+        fragmented = true;
+        frag_off   = bpf_ntohs(iph->frag_off);
+        id         = bpf_ntohs(iph->id);
     }
 
     if (!v4addr_to_v6(iph->daddr, &dst_hdr.daddr, &config.pref64, config.pref64_len))
         goto out;
 
+#ifdef NKXLAT
+    if (!v4addr_to_v6(iph->saddr, &dst_hdr.saddr, &config.pref64, config.pref64_len))
+        goto out;
+#else
     dst_hdr.saddr     = config.local_v6;
+#endif
     dst_hdr.nexthdr   = iph->protocol;
     dst_hdr.hop_limit = iph->ttl;
     /* weird definition in ipv6hdr */
@@ -599,16 +804,43 @@ clat_handle_v4(struct __sk_buff *skb, bool has_eth)
 
     switch (dst_hdr.nexthdr) {
     case IPPROTO_ICMP:
+        if (fragmented)
+            goto out;
+
         if (rewrite_icmp(skb, &dst_hdr, has_eth))
             goto out;
         dst_hdr.nexthdr = IPPROTO_ICMPV6;
         break;
     case IPPROTO_TCP:
     case IPPROTO_UDP:
-        update_l4_checksum(skb, &dst_hdr, iph, has_eth, true, false, false, NULL);
+        if (!fragmented || (bpf_ntohs(iph->frag_off) & 0x1FFF) == 0) {
+            update_l4_checksum(skb, &dst_hdr, iph, has_eth, true, false, false, NULL);
+        }
         break;
     default:
         break;
+    }
+
+    if (fragmented) {
+        struct ip6_frag *frag;
+
+        /* Add the IPv6 fragment header */
+        if (bpf_skb_adjust_room(skb, (__s32) IP6_FRAG_H_LEN, BPF_ADJ_ROOM_NET, 0))
+            goto out;
+
+        data     = SKB_DATA(skb);
+        data_end = SKB_DATA_END(skb);
+
+        if (!ensure_header(&frag, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN))
+            goto out;
+
+        frag->nexthdr        = dst_hdr.nexthdr;
+        frag->reserved       = 0;
+        frag->offset         = bpf_htons(((frag_off & (1 << 13)) >> 13) | (frag_off << 3));
+        frag->identification = bpf_htonl(id);
+
+        dst_hdr.nexthdr     = IPPROTO_FRAGMENT;
+        dst_hdr.payload_len = bpf_htons(bpf_ntohs(dst_hdr.payload_len) + (int) IP6_FRAG_H_LEN);
     }
 
     if (bpf_skb_change_proto(skb, bpf_htons(ETH_P_IPV6), 0))
@@ -627,6 +859,7 @@ clat_handle_v4(struct __sk_buff *skb, bool has_eth)
 
     *ip6h = dst_hdr;
 
+#ifndef NKXLAT
     switch (dst_hdr.nexthdr) {
     case IPPROTO_ICMPV6:
         __sync_fetch_and_add(&stats.egress_icmp, 1);
@@ -641,11 +874,14 @@ clat_handle_v4(struct __sk_buff *skb, bool has_eth)
         __sync_fetch_and_add(&stats.egress_other, 1);
         break;
     }
+#endif
 
     ret = bpf_redirect(skb->ifindex, 0);
 out:
+#ifndef NKXLAT
     if (ret == TC_ACT_SHOT)
         __sync_fetch_and_add(&stats.egress_dropped, 1);
+#endif
     return ret;
 }
 
@@ -724,7 +960,7 @@ translate_icmpv6_header(const struct icmp6hdr *icmp6, struct icmphdr *icmp)
         icmp->type = ICMP_DEST_UNREACH;
         icmp->code = ICMP_FRAG_NEEDED;
 
-        mtu = bpf_ntohl(icmp6->icmp6_mtu) - 20;
+        mtu = bpf_ntohl(icmp6->icmp6_mtu) - 28;
         if (mtu > 0xffff)
             return -1;
         icmp->un.frag.mtu = bpf_htons(mtu);
@@ -838,13 +1074,24 @@ rewrite_icmpv6_inner(struct __sk_buff *skb, __u32 *csum_diff, bool has_eth)
 }
 
 static __always_inline int
-rewrite_ipv6_inner(struct __sk_buff *skb, struct iphdr *dst_hdr, __u32 *csum_diff, bool has_eth)
+rewrite_ipv6_inner(struct __sk_buff *skb,
+                   struct iphdr     *dst_hdr,
+                   __u32            *csum_diff,
+                   int              *out_length_diff,
+                   bool              has_eth)
 {
     void           *data_end = SKB_DATA_END(skb);
     void           *data     = SKB_DATA(skb);
     struct ipv6hdr *ip6h;
     __be32          addr4;
     struct in6_addr subnet_v6;
+#ifdef NKXLAT
+    __be32          saddr4;
+    struct in6_addr ssubnet_v6;
+#endif
+    struct ipv6hdr   ip6h_buf;
+    struct ip6_frag *frag;
+    struct ip6_frag  frag_buf;
 
     /*
      * ip6h:                                  v
@@ -856,14 +1103,60 @@ rewrite_ipv6_inner(struct __sk_buff *skb, struct iphdr *dst_hdr, __u32 *csum_dif
     if (!ensure_header(&ip6h, skb, &data, &data_end, L2_H_LEN(has_eth) + IP6_H_LEN + ICMP6_H_LEN))
         return -1;
 
+    if (ip6h->nexthdr == IPPROTO_FRAGMENT) {
+        ip6h_buf = *ip6h;
+        ip6h     = &ip6h_buf;
+
+        if (!ensure_header(&frag,
+                           skb,
+                           &data,
+                           &data_end,
+                           L2_H_LEN(has_eth) + IP6_H_LEN + ICMP6_H_LEN + IP6_H_LEN))
+            return -1;
+
+        if (bpf_ntohs(frag->offset) >> 3)
+            return -1;
+
+        frag_buf = *frag;
+
+        if (bpf_skb_adjust_room(skb, -(__s32) IP6_FRAG_H_LEN, BPF_ADJ_ROOM_NET, 0))
+            return -1;
+
+        *out_length_diff -= (int) IP6_FRAG_H_LEN;
+
+        if (csum_diff) {
+            *csum_diff = bpf_csum_diff((__be32 *) &frag_buf,
+                                       IP6_FRAG_H_LEN,
+                                       (__be32 *) &frag_buf,
+                                       0,
+                                       *csum_diff);
+        }
+    }
+
+#ifdef NKXLAT
+    if (!v6addr_to_v4(&ip6h->saddr, config.pref64_len, &saddr4, &ssubnet_v6))
+        return -1;
+    if (!v6addr_equal(&ssubnet_v6, &config.pref64))
+        return -1;
+#else
     if (!v6addr_equal(&ip6h->saddr, &config.local_v6))
         return -1;
+#endif
     if (!v6addr_to_v4(&ip6h->daddr, config.pref64_len, &addr4, &subnet_v6))
         return -1;
     if (!v6addr_equal(&subnet_v6, &config.pref64))
         return -1;
 
+#ifdef NKXLAT
+    translate_ipv6_header(ip6h, dst_hdr, saddr4, addr4);
+#else
     translate_ipv6_header(ip6h, dst_hdr, config.local_v4.s_addr, addr4);
+#endif
+
+    if (dst_hdr->protocol == IPPROTO_FRAGMENT) {
+        dst_hdr->protocol = frag_buf.nexthdr;
+        dst_hdr->frag_off = bpf_htons(1 << 13);
+    }
 
     if (csum_diff) {
         /* Checksum difference between the old IPv6 header and the new IPv4 one */
@@ -889,7 +1182,7 @@ rewrite_ipv6_inner(struct __sk_buff *skb, struct iphdr *dst_hdr, __u32 *csum_dif
 }
 
 static __always_inline int
-rewrite_icmpv6(struct __sk_buff *skb, int *out_length_diff, bool has_eth)
+rewrite_icmpv6(struct __sk_buff *skb, int *out_length_diff, bool *is_icmp_error, bool has_eth)
 {
     void            *data_end = SKB_DATA_END(skb);
     void            *data     = SKB_DATA(skb);
@@ -932,11 +1225,13 @@ rewrite_icmpv6(struct __sk_buff *skb, int *out_length_diff, bool has_eth)
         return 0;
     }
 
+    *is_icmp_error = true;
+
     /* ICMPv6 error messages: we need to rewrite the headers in the inner packet.
      * Track in csum_diff the incremental changes to the checksum for the ICMPv4
      * header. */
 
-    if (rewrite_ipv6_inner(skb, &ip_in_buf, &csum_diff, has_eth))
+    if (rewrite_ipv6_inner(skb, &ip_in_buf, &csum_diff, out_length_diff, has_eth))
         return -1;
 
     /* The inner IP header shrinks from 40 (IPv6) to 20 (IPv4) bytes; we need to move
@@ -949,7 +1244,7 @@ rewrite_icmpv6(struct __sk_buff *skb, int *out_length_diff, bool has_eth)
     if (bpf_skb_adjust_room(skb, (int) IP_H_LEN - (int) IP6_H_LEN, BPF_ADJ_ROOM_NET, 0))
         return -1;
 
-    *out_length_diff = (int) IP_H_LEN - (int) IP6_H_LEN;
+    *out_length_diff += (int) IP_H_LEN - (int) IP6_H_LEN;
 
     data_end = SKB_DATA_END(skb);
     data     = SKB_DATA(skb);
@@ -981,7 +1276,11 @@ rewrite_icmpv6(struct __sk_buff *skb, int *out_length_diff, bool has_eth)
 static __always_inline int
 clat_handle_v6(struct __sk_buff *skb, bool has_eth)
 {
+#ifdef NKXLAT
+    int ret = TC_ACT_SHOT;
+#else
     int             ret      = TC_ACT_OK;
+#endif
     void           *data_end = SKB_DATA_END(skb);
     void           *data     = SKB_DATA(skb);
     struct ethhdr  *eth;
@@ -990,8 +1289,15 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
     struct iphdr    dst_hdr;
     struct in6_addr subnet_v6;
     __be32          addr4;
+#ifdef NKXLAT
+    struct in6_addr dsubnet_v6;
+    __be32          daddr4;
+#endif
     int             length_diff = 0;
     bool            fragmented  = false;
+    bool            is_icmp_error  = false;
+    bool            untranslatable = false;
+    struct in6_addr addr6;
 
     if (!ensure_header(&ip6h, skb, &data, &data_end, L2_H_LEN(has_eth)))
         goto out;
@@ -1005,8 +1311,15 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
     if (ip6h->version != 6)
         goto out;
 
+#ifdef NKXLAT
+    if (!v6addr_to_v4(&ip6h->daddr, config.pref64_len, &daddr4, &dsubnet_v6))
+        goto out;
+    if (!v6addr_equal(&dsubnet_v6, &config.pref64))
+        goto out;
+#else
     if (!v6addr_equal(&ip6h->daddr, &config.local_v6))
         goto out;
+#endif
     if (!v6addr_to_v4(&ip6h->saddr, config.pref64_len, &addr4, &subnet_v6))
         goto out;
     if (!v6addr_equal(&subnet_v6, &config.pref64)) {
@@ -1037,7 +1350,14 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
             icmp6->icmp6_type,
             &ip6h->saddr);
 
+        untranslatable = true;
+        addr6          = ip6h->saddr;
+
+#ifdef NKXLAT
+        addr4 = config.untranslatable_v4.s_addr;
+#else
         addr4 = __cpu_to_be32(INADDR_DUMMY);
+#endif
     }
 
     /* At this point we know the packet needs translation. If we can't
@@ -1047,7 +1367,11 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
 
     if (ip6h->nexthdr == IPPROTO_TCP || ip6h->nexthdr == IPPROTO_UDP
         || ip6h->nexthdr == IPPROTO_ICMPV6) {
+#ifdef NKXLAT
+        translate_ipv6_header(ip6h, &dst_hdr, addr4, daddr4);
+#else
         translate_ipv6_header(ip6h, &dst_hdr, addr4, config.local_v4.s_addr);
+#endif
         DBG("v6: incoming pkt from src %pI6c (%pI4)\n", &ip6h->saddr, &addr4);
     } else if (ip6h->nexthdr == IPPROTO_FRAGMENT) {
         struct ip6_frag *frag;
@@ -1076,7 +1400,11 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
             .ttl      = ip6h->hop_limit,
             .protocol = frag->nexthdr == IPPROTO_ICMPV6 ? IPPROTO_ICMP : frag->nexthdr,
             .saddr    = addr4,
+#ifdef NKXLAT
+            .daddr    = daddr4,
+#else
             .daddr    = config.local_v4.s_addr,
+#endif
             .tot_len  = bpf_htons(tot_len),
         };
 
@@ -1105,7 +1433,7 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
         if (fragmented)
             goto out;
 
-        if (rewrite_icmpv6(skb, &length_diff, has_eth))
+        if (rewrite_icmpv6(skb, &length_diff, &is_icmp_error, has_eth))
             goto out;
         break;
     case IPPROTO_TCP:
@@ -1145,6 +1473,95 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
             goto out;
     }
 
+    if (is_icmp_error && (bpf_htons(dst_hdr.tot_len) > 576 || untranslatable)) {
+        struct {
+            struct icmphdr hdr;
+            struct {
+                struct iphdr hdr;
+                __u8         data[576 - IP_H_LEN - ICMP_H_LEN - IP_H_LEN];
+            } orig;
+        } *icmp;
+        int icmp_size;
+
+        if (bpf_skb_change_tail(skb, L2_H_LEN(has_eth) + IP_H_LEN + sizeof(*icmp), 0))
+            goto out;
+
+        data     = SKB_DATA(skb);
+        data_end = SKB_DATA_END(skb);
+
+        if (!ensure_header(&icmp, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN))
+            goto out;
+
+        icmp_size = ICMP_H_LEN + bpf_ntohs(icmp->orig.hdr.tot_len);
+        if (icmp_size % 4)
+            icmp_size += 4 - icmp_size % 4;
+        if (icmp_size > sizeof(*icmp))
+            icmp_size = sizeof(*icmp);
+
+        if (untranslatable) {
+            struct {
+                struct icmp_ext_hdr      hdr;
+                struct icmp_ext_echo_iio iio;
+            }  *icmp_ext;
+            int icmp_ext_offset;
+
+            if (icmp_size < sizeof(icmp->hdr) + 128 + sizeof(*icmp_ext))
+                icmp_size = sizeof(icmp->hdr) + 128 + sizeof(*icmp_ext);
+
+            icmp_ext_offset = icmp_size - sizeof(*icmp_ext);
+
+            if (!ensure_header(&icmp_ext,
+                               skb,
+                               &data,
+                               &data_end,
+                               L2_H_LEN(has_eth) + IP_H_LEN + icmp_ext_offset))
+                goto out;
+
+            *icmp_ext = (typeof(*icmp_ext)) {
+                .hdr =
+                    {
+                        .version = 2,
+                    },
+                .iio =
+                    {
+                        .extobj_hdr =
+                            {
+                                .length = bpf_htons(sizeof(icmp_ext->iio)),
+                                /* XXX should be class_num=5, class_type=5 according to draft-ietf-v6ops-icmpext-xlat-v6only-source but traceroute can't decode that yet */
+                                .class_num  = 2,
+                                .class_type = 4,
+                            },
+                        .ident.addr =
+                            {
+                                .ctype3_hdr.afi    = bpf_htons(ICMP_AFI_IP6),
+                                .ip_addr.ipv6_addr = addr6,
+                            },
+                    },
+            };
+
+            icmp_ext->hdr.checksum = csum_fold_helper(
+                bpf_csum_diff((__be32 *) icmp_ext, 0, (__be32 *) icmp_ext, sizeof(*icmp_ext), 0));
+
+            if (!ensure_header(&icmp, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN))
+                goto out;
+
+            icmp->hdr.un.reserved[1] = (icmp_ext_offset - ICMP_H_LEN) / 4;
+        }
+
+        icmp->hdr.checksum = 0;
+        icmp->hdr.checksum =
+            csum_fold_helper(bpf_csum_diff((__be32 *) icmp, 0, (__be32 *) icmp, icmp_size, 0));
+
+        if (bpf_skb_change_tail(skb, L2_H_LEN(has_eth) + IP_H_LEN + icmp_size, 0))
+            goto out;
+
+        dst_hdr.tot_len = bpf_htons(IP_H_LEN + icmp_size);
+
+        dst_hdr.check = 0;
+        dst_hdr.check = csum_fold_helper(
+            bpf_csum_diff((__be32 *) &dst_hdr, 0, (__be32 *) &dst_hdr, IP_H_LEN, 0));
+    }
+
     data     = SKB_DATA(skb);
     data_end = SKB_DATA_END(skb);
 
@@ -1158,6 +1575,7 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
 
     *iph = dst_hdr;
 
+#ifndef NKXLAT
     if (fragmented)
         __sync_fetch_and_add(&stats.ingress_fragment, 1);
     switch (dst_hdr.protocol) {
@@ -1174,11 +1592,18 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
         __sync_fetch_and_add(&stats.ingress_other, 1);
         break;
     }
+#endif
 
+#ifdef NKXLAT
+    ret = bpf_redirect(skb->ifindex, 0);
+#else
     ret = bpf_redirect(skb->ifindex, BPF_F_INGRESS);
+#endif
 out:
+#ifndef NKXLAT
     if (ret == TC_ACT_SHOT)
         __sync_fetch_and_add(&stats.ingress_dropped, 1);
+#endif
     return ret;
 }
 
@@ -1189,6 +1614,34 @@ out:
  * pointer arithmetic which is forbidden because we don't run with
  * CAP_PERFMON. The loader attaches the right program pair based
  * on the interface type. */
+#ifdef NKXLAT
+SEC("netkit/peer")
+int
+nm_clat_peer(struct __sk_buff *skb)
+{
+    void          *data_end = SKB_DATA_END(skb);
+    void          *data     = SKB_DATA(skb);
+    struct ethhdr *eth;
+
+    if (!ensure_header(&eth, skb, &data, &data_end, 0)) {
+        return TC_ACT_SHOT;
+    }
+
+    if (eth->h_dest[0] & 0x01) {
+        return TC_ACT_SHOT;
+    }
+
+    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+        return clat_handle_v4(skb, true);
+    }
+
+    if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+        return clat_handle_v6(skb, true);
+    }
+
+    return TC_ACT_SHOT;
+}
+#else
 SEC("tcx/egress")
 int
 nm_clat_egress_eth(struct __sk_buff *skb)
@@ -1216,3 +1669,4 @@ nm_clat_ingress_rawip(struct __sk_buff *skb)
 {
     return clat_handle_v6(skb, false);
 }
+#endif

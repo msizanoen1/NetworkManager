@@ -2,15 +2,22 @@
 #ifndef __NAT64_H__
 #define __NAT64_H__
 
+#ifndef NKXLAT
 #include <linux/in6.h>
+#endif
 
 struct clat_config {
+#ifdef NKXLAT
+    struct in_addr untranslatable_v4;
+#else
     struct in6_addr local_v6;
-    struct in6_addr pref64;
     struct in_addr  local_v4;
+#endif
+    struct in6_addr pref64;
     unsigned        pref64_len;
 };
 
+#ifndef NKXLAT
 struct clat_stats {
     /* egress: v4 to v6 */
     __u64 egress_tcp;
@@ -26,5 +33,6 @@ struct clat_stats {
     __u64 ingress_fragment;
     __u64 ingress_dropped;
 };
+#endif
 
 #endif
