@@ -1546,8 +1546,17 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
         }
 
         icmp->hdr.checksum = 0;
-        icmp->hdr.checksum =
-            csum_fold_helper(bpf_csum_diff((__be32 *) icmp, 0, (__be32 *) icmp, icmp_size, 0));
+        if (icmp_size > 512) {
+            icmp->hdr.checksum = csum_fold_helper(
+                bpf_csum_diff((void *) icmp + 512,
+                              0,
+                              (void *) icmp + 512,
+                              icmp_size - 512,
+                              bpf_csum_diff((__be32 *) icmp, 0, (__be32 *) icmp, 512, 0)));
+        } else {
+            icmp->hdr.checksum =
+                csum_fold_helper(bpf_csum_diff((__be32 *) icmp, 0, (__be32 *) icmp, icmp_size, 0));
+        }
 
         if (bpf_skb_change_tail(skb, L2_H_LEN(has_eth) + IP_H_LEN + icmp_size, 0))
             goto out;
