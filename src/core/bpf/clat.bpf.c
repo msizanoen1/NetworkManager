@@ -1502,6 +1502,7 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
             struct {
                 struct icmp_ext_hdr      hdr;
                 struct icmp_ext_echo_iio iio;
+                struct icmp_ext_echo_iio nio;
             }  *icmp_ext;
             int icmp_ext_offset;
 
@@ -1519,22 +1520,16 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
 
             *icmp_ext = (typeof(*icmp_ext)) {
                 .hdr.version = 2,
-                .iio =
-                    {
-                        .extobj_hdr =
-                            {
-                                .length = bpf_htons(sizeof(icmp_ext->iio)),
-                                /* XXX should be class_num=5, class_type=5 according to draft-ietf-v6ops-icmpext-xlat-v6only-source but traceroute can't decode that yet */
-                                .class_num  = 2,
-                                .class_type = 4,
-                            },
-                        .ident.addr =
-                            {
-                                .ctype3_hdr.afi    = bpf_htons(ICMP_AFI_IP6),
-                                .ip_addr.ipv6_addr = addr6,
-                            },
-                    },
-            };
+                .iio = {.extobj_hdr = {.length     = bpf_htons(sizeof(icmp_ext->iio)),
+                                       .class_num  = 2 /* Interface Information Object */,
+                                       .class_type = 1 << 2 /* IP Address Sub-object included */},
+                        .ident.addr = {.ctype3_hdr.afi    = bpf_htons(ICMP_AFI_IP6),
+                                       .ip_addr.ipv6_addr = addr6}},
+                .nio = {.extobj_hdr = {.length     = bpf_htons(sizeof(icmp_ext->nio)),
+                                       .class_num  = 5 /* Node Identification Object */,
+                                       .class_type = 1 << 2 /* IP Address Sub-object included */},
+                        .ident.addr = {.ctype3_hdr.afi    = bpf_htons(ICMP_AFI_IP6),
+                                       .ip_addr.ipv6_addr = addr6}}};
 
             icmp_ext->hdr.checksum = csum_fold_helper(
                 bpf_csum_diff((__be32 *) icmp_ext, 0, (__be32 *) icmp_ext, sizeof(*icmp_ext), 0));
