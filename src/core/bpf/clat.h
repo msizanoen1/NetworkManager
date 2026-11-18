@@ -9,11 +9,14 @@
 struct clat_config {
 #ifdef NKXLAT
     struct in_addr untranslatable_v4;
-#else
+#endif
+#ifndef NKXLAT
     struct in6_addr local_v6;
-    struct in_addr  local_v4;
 #endif
     struct in6_addr pref64;
+#ifndef NKXLAT
+    struct in_addr  local_v4;
+#endif
     unsigned        pref64_len;
 };
 
