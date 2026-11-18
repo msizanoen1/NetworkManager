@@ -13,65 +13,6 @@
  * Check out src/core/bpf/meson.build to see how this gets built.
  **/
 
-#ifdef NKXLAT
-#include <vmlinux.h>
-
-#define TC_ACT_SHOT 2
-
-#define ETH_P_IP   0x0800 /* Internet Protocol packet     */
-#define ETH_P_IPV6 0x86DD /* IPv6 over bluebook           */
-
-#define IPPROTO_FRAGMENT 44 /* IPv6 fragmentation header	*/
-#define IPPROTO_ICMPV6   58 /* ICMPv6			*/
-
-#define s6_addr   in6_u.u6_addr8
-#define s6_addr16 in6_u.u6_addr16
-#define s6_addr32 in6_u.u6_addr32
-
-#define ICMP_ECHOREPLY     0  /* Echo Reply			*/
-#define ICMP_DEST_UNREACH  3  /* Destination Unreachable	*/
-#define ICMP_ECHO          8  /* Echo Request			*/
-#define ICMP_TIME_EXCEEDED 11 /* Time Exceeded		*/
-#define ICMP_PARAMETERPROB 12 /* Parameter Problem		*/
-#define ICMP_NET_UNREACH   0  /* Network Unreachable		*/
-#define ICMP_HOST_UNREACH  1  /* Host Unreachable		*/
-#define ICMP_PROT_UNREACH  2  /* Protocol Unreachable		*/
-#define ICMP_PORT_UNREACH  3  /* Port Unreachable		*/
-#define ICMP_FRAG_NEEDED   4  /* Fragmentation Needed/DF set	*/
-#define ICMP_SR_FAILED     5  /* Source Route failed		*/
-#define ICMP_NET_UNKNOWN   6
-#define ICMP_HOST_UNKNOWN  7
-#define ICMP_HOST_ISOLATED 8
-#define ICMP_NET_ANO       9
-#define ICMP_HOST_ANO      10
-#define ICMP_NET_UNR_TOS   11
-#define ICMP_HOST_UNR_TOS  12
-#define ICMP_PKT_FILTERED  13 /* Packet filtered */
-#define ICMP_PREC_CUTOFF   15 /* Precedence cut off */
-#define ICMP_EXC_TTL       0  /* TTL count exceeded		*/
-#define ICMP_EXC_FRAGTIME  1  /* Fragment Reass time exceeded	*/
-
-#define ICMPV6_DEST_UNREACH   1
-#define ICMPV6_PKT_TOOBIG     2
-#define ICMPV6_TIME_EXCEED    3
-#define ICMPV6_PARAMPROB      4
-#define ICMPV6_ECHO_REQUEST   128
-#define ICMPV6_ECHO_REPLY     129
-#define ICMPV6_NOROUTE        0
-#define ICMPV6_ADM_PROHIBITED 1
-#define ICMPV6_NOT_NEIGHBOUR  2
-#define ICMPV6_ADDR_UNREACH   3
-#define ICMPV6_PORT_UNREACH   4
-#define ICMPV6_EXC_HOPLIMIT   0
-#define ICMPV6_EXC_FRAGTIME   1
-#define ICMPV6_HDR_FIELD      0
-#define ICMPV6_UNK_NEXTHDR    1
-
-#define icmp6_pointer icmp6_dataun.un_data32[0]
-#define icmp6_mtu     icmp6_dataun.un_data32[0]
-
-#define ICMP_AFI_IP6 2 /* Address Family Identifier for ipv6 */
-#else
 #include <linux/bpf.h>
 #include <linux/icmp.h>
 #include <linux/icmpv6.h>
@@ -84,9 +25,6 @@
 #include <linux/udp.h>
 #include <linux/if_ether.h>
 #include <stdbool.h>
-#endif
-
-#define IP_MSS 576 /* default maximum segment size */
 
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
@@ -1485,11 +1423,11 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
             goto out;
     }
 
-    if (is_icmp_error && (bpf_htons(dst_hdr.tot_len) > IP_MSS || untranslatable)) {
+    if (is_icmp_error && (bpf_htons(dst_hdr.tot_len) > 576 || untranslatable)) {
         struct {
             struct icmphdr hdr;
             struct iphdr   iph;
-            __u8           data[IP_MSS - IP_H_LEN - ICMP_H_LEN - IP_H_LEN];
+            __u8           data[576 - IP_H_LEN - ICMP_H_LEN - IP_H_LEN];
         } *icmp;
         int icmp_size;
 
@@ -1628,27 +1566,24 @@ out:
 #ifdef NKXLAT
 SEC("netkit/peer")
 int
-nm_clat_peer(struct __sk_buff *skb)
+nkxlat_peer(struct __sk_buff *skb)
 {
     void          *data_end = SKB_DATA_END(skb);
     void          *data     = SKB_DATA(skb);
     struct ethhdr *eth;
 
-    if (!ensure_header(&eth, skb, &data, &data_end, 0)) {
+    if (!ensure_header(&eth, skb, &data, &data_end, 0))
         return TC_ACT_SHOT;
-    }
 
-    if (eth->h_dest[0] & 0x01) {
+    /* Block group packets */
+    if (eth->h_dest[0] & 0x01)
         return TC_ACT_SHOT;
-    }
 
-    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+    if (eth->h_proto == bpf_htons(ETH_P_IP))
         return clat_handle_v4(skb, true);
-    }
 
-    if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+    if (eth->h_proto == bpf_htons(ETH_P_IPV6))
         return clat_handle_v6(skb, true);
-    }
 
     return TC_ACT_SHOT;
 }
