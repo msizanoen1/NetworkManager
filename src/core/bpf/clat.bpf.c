@@ -86,6 +86,8 @@
 #include <stdbool.h>
 #endif
 
+#define IP_MSS 576 /* default maximum segment size */
+
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
@@ -1473,13 +1475,11 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
             goto out;
     }
 
-    if (is_icmp_error && (bpf_htons(dst_hdr.tot_len) > 576 || untranslatable)) {
+    if (is_icmp_error && (bpf_htons(dst_hdr.tot_len) > IP_MSS || untranslatable)) {
         struct {
             struct icmphdr hdr;
-            struct {
-                struct iphdr hdr;
-                __u8         data[576 - IP_H_LEN - ICMP_H_LEN - IP_H_LEN];
-            } orig;
+            struct iphdr   iph;
+            __u8           data[IP_MSS - IP_H_LEN - ICMP_H_LEN - IP_H_LEN];
         } *icmp;
         int icmp_size;
 
@@ -1492,7 +1492,7 @@ clat_handle_v6(struct __sk_buff *skb, bool has_eth)
         if (!ensure_header(&icmp, skb, &data, &data_end, L2_H_LEN(has_eth) + IP_H_LEN))
             goto out;
 
-        icmp_size = ICMP_H_LEN + bpf_ntohs(icmp->orig.hdr.tot_len);
+        icmp_size = ICMP_H_LEN + bpf_ntohs(icmp->iph.tot_len);
         if (icmp_size % 4)
             icmp_size += 4 - icmp_size % 4;
         if (icmp_size > sizeof(*icmp))
